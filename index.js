@@ -1763,7 +1763,7 @@ const { v4: uuidv4 } = require("uuid");
 const mongoose = require("mongoose");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const PORT = process.env.BYD_VOICE_PORT || 4000;
+const PORT = process.env.BYD_VOICE_PORT || 4030;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID =
