@@ -2211,6 +2211,29 @@ async function handleRealtimeEvent(sessionId, event) {
       session.onEvent({ type: "transcript-delta", delta: event.delta });
       break;
 
+    // Audio transcript deltas — companion text when modalities includes audio
+    case "response.audio_transcript.delta":
+      sendTextToElevenLabs(sessionId, event.delta);
+      session.currentAssistantText += event.delta || "";
+      session.onEvent({ type: "transcript-delta", delta: event.delta });
+      break;
+
+    // Native OpenAI audio — fallback if ElevenLabs is not connected
+    case "response.audio.delta":
+      if (event.delta) {
+        if (
+          !session.elevenLabsWs ||
+          session.elevenLabsWs.readyState !== WebSocket.OPEN
+        ) {
+          session.recorder.addAgentAudio(event.delta);
+          session.onEvent({ type: "audio-delta", delta: event.delta });
+        }
+      }
+      break;
+
+    case "response.audio.done":
+      break;
+
     case "response.output_text.done":
     case "response.text.done": {
       flushElevenLabsStream(sessionId);
@@ -2229,6 +2252,17 @@ async function handleRealtimeEvent(sessionId, event) {
       }
       session.currentAssistantText = "";
       session.onEvent({ type: "transcript-done", transcript: event.text });
+      break;
+    }
+
+    case "response.audio_transcript.done": {
+      flushElevenLabsStream(sessionId);
+      const aText = (event.transcript || session.currentAssistantText || "").trim();
+      if (aText) {
+        session.transcript.push({ role: "assistant", text: aText, ts: Date.now() });
+      }
+      session.currentAssistantText = "";
+      session.onEvent({ type: "transcript-done", transcript: event.transcript });
       break;
     }
 
@@ -2251,15 +2285,24 @@ async function handleRealtimeEvent(sessionId, event) {
       break;
 
     case "input_audio_buffer.speech_started":
-      console.log(`[${sessionId}] User interrupted — stopping AI voice`);
+      console.log(`[${sessionId}] User speech started (VAD)`);
 
       if (session.isResponseActive) {
+        console.log(`[${sessionId}] User interrupted — stopping AI voice`);
         sendWsJson(session.ws, { type: "response.cancel" });
         session.isResponseActive = false;
+        openElevenLabsStream(sessionId, true); // Force restart ElevenLabs stream to cut off audio instantly
       }
 
-      openElevenLabsStream(sessionId, true);
       session.onEvent({ type: "speech-started" });
+      break;
+
+    case "input_audio_buffer.speech_stopped":
+      console.log(`[${sessionId}] User speech stopped (VAD)`);
+      break;
+
+    case "input_audio_buffer.committed":
+      console.log(`[${sessionId}] Audio buffer committed — AI generating`);
       break;
 
     case "conversation.item.input_audio_transcription.completed":
@@ -2278,6 +2321,11 @@ async function handleRealtimeEvent(sessionId, event) {
       break;
 
     case "error":
+      if (event.error && event.error.code === "response_cancel_not_active") {
+        // Harmless race condition when VAD triggers a cancel right as a response finishes
+        console.log(`[${sessionId}] Ignored response_cancel_not_active error`);
+        break;
+      }
       console.error(
         `[${sessionId}] OpenAI error:`,
         JSON.stringify(event.error),
