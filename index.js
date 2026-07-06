@@ -1211,7 +1211,6 @@
 // ╚══════════════════════════════════════════════════════════════╝
 //   `);
 // });
-
 require("dotenv").config();
 
 const express = require("express");
@@ -1231,6 +1230,7 @@ const ELEVENLABS_VOICE_ID =
   process.env.ELEVENLABS_VOICE_ID || "EXAVITQu4vr4xnSDxMaL";
 const MONGODB_URI = process.env.MONGODB_URI;
 const PREWARM_TTL_MS = 60_000;
+const PREWARM_CONNECT_DELAY_MS = 400; // NEW: debounce prewarm to avoid burning real connections on rapid connect/disconnect (StrictMode, fast refresh, flaky network)
 
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
@@ -1330,6 +1330,7 @@ app.use("/recordings", express.static(RECORDINGS_DIR));
 // ─── Session State ────────────────────────────────────────────────────────────
 const sessions = new Map();
 const prewarmStates = new Map();
+const prewarmTimers = new Map(); // NEW: pending debounced prewarm timers per socket id
 
 // ─── BYD Knowledge Base ───────────────────────────────────────────────────────
 const BYD_KNOWLEDGE_SUMMARY = `
@@ -1732,7 +1733,7 @@ function extractFunctionCallsFromResponse(response) {
   return calls;
 }
 
-// ─── NEW: End-of-call summary generator ───────────────────────────────────────
+// ─── End-of-call summary generator ────────────────────────────────────────────
 // Uses a plain OpenAI Chat Completions call (not the realtime socket) to turn
 // the accumulated transcript into a structured summary once the call ends.
 async function generateCallSummary(transcriptArray) {
@@ -1862,8 +1863,8 @@ function createRealtimeSession(sessionId, onEvent, carContext) {
         recorder: new ConversationRecorder(sessionId),
         callLogs: [],
         elevenLabsOpening: false,
-        transcript: [], // NEW: full conversation transcript { role, text, ts }
-        currentAssistantText: "", // NEW: accumulates streaming text deltas
+        transcript: [], // full conversation transcript { role, text, ts }
+        currentAssistantText: "", // accumulates streaming text deltas
       };
 
       sessions.set(sessionId, session);
@@ -2150,7 +2151,7 @@ async function handleFunctionCall(sessionId, eventOrItem) {
       sentiment: args.sentiment || "neutral",
       confidence_score: args.confidence_score || null,
       escalated: args.escalated || false,
-      full_transcript: session.transcript || [], // NEW
+      full_transcript: session.transcript || [],
     });
 
     await callLog.save();
@@ -2190,7 +2191,7 @@ async function handleRealtimeEvent(sessionId, event) {
 
     case "response.created":
       session.isResponseActive = true;
-      session.currentAssistantText = ""; // NEW: reset accumulator for new turn
+      session.currentAssistantText = ""; // reset accumulator for new turn
       if (!session.firstResponseCreatedMs) {
         session.firstResponseCreatedMs = Date.now();
       }
@@ -2206,14 +2207,14 @@ async function handleRealtimeEvent(sessionId, event) {
     case "response.output_text.delta":
     case "response.text.delta":
       sendTextToElevenLabs(sessionId, event.delta);
-      session.currentAssistantText += event.delta || ""; // NEW
+      session.currentAssistantText += event.delta || "";
       session.onEvent({ type: "transcript-delta", delta: event.delta });
       break;
 
     case "response.output_text.done":
     case "response.text.done": {
       flushElevenLabsStream(sessionId);
-      // NEW: push finished assistant turn into transcript
+      // push finished assistant turn into transcript
       const assistantText = (
         event.text ||
         session.currentAssistantText ||
@@ -2262,7 +2263,7 @@ async function handleRealtimeEvent(sessionId, event) {
       break;
 
     case "conversation.item.input_audio_transcription.completed":
-      // NEW: push user turn into transcript
+      // push user turn into transcript
       if (event.transcript && event.transcript.trim()) {
         session.transcript.push({
           role: "user",
@@ -2293,56 +2294,70 @@ async function handleRealtimeEvent(sessionId, event) {
 async function closeSession(sessionId) {
   const session = sessions.get(sessionId);
   if (session) {
-    try {
-      const result = session.recorder.saveToFile();
-      session.onEvent({
-        type: "recording-saved",
-        data: {
-          filename: result.filename,
-          url: `/recordings/${result.filename}`,
-        },
-      });
-    } catch (err) {
-      console.error(`[${sessionId}] Recording save failed:`, err.message);
-    }
+    // FIX: skip the save/summary pipeline entirely for sessions that never
+    // had a real conversation (e.g. idle prewarm sessions that got closed or
+    // replaced before the caller said anything). Previously this always ran,
+    // which meant every page load / reconnect / car-context switch wrote a
+    // junk "No conversation took place" row to Mongo and burned an extra
+    // OpenAI chat-completions call for nothing.
+    const hadConversation = session.transcript && session.transcript.length > 0;
 
-    // NEW: generate end-of-call summary and swap the live transcript for it
-    try {
-      const summaryData = await generateCallSummary(session.transcript);
-
-      session.onEvent({
-        type: "call-summary",
-        data: {
-          ...summaryData,
-          fullTranscript: session.transcript,
-        },
-      });
-
-      // Only persist a new log if save_call_log wasn't already called mid-call
-      // (avoids duplicate entries — the tool-based log already has full_transcript)
-      if (session.callLogs.length === 0) {
-        const logId = uuidv4();
-        const callLog = new CallLog({
-          id: logId,
-          sessionId,
-          caller_name: summaryData.caller_name || null,
-          vehicle_interest:
-            summaryData.vehicle_interest || session.carContext || null,
-          intent_category: summaryData.intent_category || "no_transcript_admin",
-          outcome: summaryData.outcome || "message_taken",
-          ai_summary: summaryData.summary || null,
-          sentiment: summaryData.sentiment || "neutral",
-          confidence_score: summaryData.confidence_score ?? null,
-          escalated: false,
-          full_transcript: session.transcript || [],
+    if (hadConversation) {
+      try {
+        const result = session.recorder.saveToFile();
+        session.onEvent({
+          type: "recording-saved",
+          data: {
+            filename: result.filename,
+            url: `/recordings/${result.filename}`,
+          },
         });
-        await callLog.save();
-        console.log(`[${sessionId}] End-of-call summary saved: ${logId}`);
+      } catch (err) {
+        console.error(`[${sessionId}] Recording save failed:`, err.message);
       }
-    } catch (err) {
-      console.error(
-        `[${sessionId}] Summary generation/save failed:`,
-        err.message,
+
+      try {
+        const summaryData = await generateCallSummary(session.transcript);
+
+        session.onEvent({
+          type: "call-summary",
+          data: {
+            ...summaryData,
+            fullTranscript: session.transcript,
+          },
+        });
+
+        // Only persist a new log if save_call_log wasn't already called mid-call
+        // (avoids duplicate entries — the tool-based log already has full_transcript)
+        if (session.callLogs.length === 0) {
+          const logId = uuidv4();
+          const callLog = new CallLog({
+            id: logId,
+            sessionId,
+            caller_name: summaryData.caller_name || null,
+            vehicle_interest:
+              summaryData.vehicle_interest || session.carContext || null,
+            intent_category:
+              summaryData.intent_category || "no_transcript_admin",
+            outcome: summaryData.outcome || "message_taken",
+            ai_summary: summaryData.summary || null,
+            sentiment: summaryData.sentiment || "neutral",
+            confidence_score: summaryData.confidence_score ?? null,
+            escalated: false,
+            full_transcript: session.transcript || [],
+          });
+          await callLog.save();
+          console.log(`[${sessionId}] End-of-call summary saved: ${logId}`);
+        }
+      } catch (err) {
+        console.error(
+          `[${sessionId}] Summary generation/save failed:`,
+          err.message,
+        );
+      }
+    } else {
+      console.log(
+        `[${sessionId}] Closing empty session — skipping recording/summary/save`,
       );
     }
 
@@ -2412,7 +2427,7 @@ function buildEventForwarder(socket) {
       case "call-logged":
         socket.emit("call-logged", event.data);
         break;
-      case "call-summary": // NEW
+      case "call-summary":
         socket.emit("call-summary", event.data);
         break;
       case "recording-saved":
@@ -2433,8 +2448,15 @@ io.on("connection", (socket) => {
   console.log(`Client connected: ${socket.id}`);
   const forwarder = buildEventForwarder(socket);
 
-  // Prewarm immediately on connection (generic, no car context)
-  startPrewarm(socket.id, forwarder).catch(() => {});
+  // FIX: debounce prewarm instead of firing it instantly on every connect.
+  // This avoids opening a real OpenAI Realtime WS + ElevenLabs WS for
+  // transient connections (React StrictMode double-mount, fast refresh,
+  // brief network blips) that disconnect again within a few hundred ms.
+  const prewarmTimer = setTimeout(() => {
+    prewarmTimers.delete(socket.id);
+    startPrewarm(socket.id, forwarder).catch(() => {});
+  }, PREWARM_CONNECT_DELAY_MS);
+  prewarmTimers.set(socket.id, prewarmTimer);
 
   socket.on("start-session", async (data) => {
     const sessionId = socket.id;
@@ -2443,10 +2465,18 @@ io.on("connection", (socket) => {
       `[${sessionId}] Starting voice session${carContext ? ` | Car: ${carContext}` : ""}`,
     );
 
+    // If prewarm hasn't fired yet, cancel it — we're about to create the
+    // session ourselves (either reusing logic below or with carContext).
+    const pendingPrewarm = prewarmTimers.get(sessionId);
+    if (pendingPrewarm) {
+      clearTimeout(pendingPrewarm);
+      prewarmTimers.delete(sessionId);
+    }
+
     try {
       if (carContext) {
         clearPrewarmState(sessionId);
-        await closeSession(sessionId); // NEW: await since closeSession is now async
+        await closeSession(sessionId);
 
         await createRealtimeSession(sessionId, forwarder, carContext);
         socket.emit("session-started", { sessionId });
@@ -2487,7 +2517,7 @@ io.on("connection", (socket) => {
     if (data?.audio) sendAudio(socket.id, data.audio);
   });
 
-  // NEW: client can request the live transcript at any point during the call
+  // client can request the live transcript at any point during the call
   socket.on("get-transcript", () => {
     const session = sessions.get(socket.id);
     socket.emit("transcript-state", {
@@ -2498,12 +2528,21 @@ io.on("connection", (socket) => {
   socket.on("end-session", async () => {
     console.log(`[${socket.id}] End session requested`);
     clearPrewarmState(socket.id);
-    await closeSession(socket.id); // NEW: await — summary is generated before this resolves
+    await closeSession(socket.id); // summary is generated before this resolves (if there was a conversation)
     socket.emit("session-closed", {});
   });
 
   socket.on("disconnect", async () => {
     console.log(`Client disconnected: ${socket.id}`);
+
+    // Cancel any pending debounced prewarm so a fast connect/disconnect
+    // cycle never opens a real connection at all.
+    const pendingPrewarm = prewarmTimers.get(socket.id);
+    if (pendingPrewarm) {
+      clearTimeout(pendingPrewarm);
+      prewarmTimers.delete(socket.id);
+    }
+
     clearPrewarmState(socket.id);
     await closeSession(socket.id);
   });
@@ -2546,7 +2585,7 @@ app.get("/api/recordings", (req, res) => {
   );
 });
 
-// NEW: standalone summary endpoint — pass { transcript: [{role, text}, ...] }
+// standalone summary endpoint — pass { transcript: [{role, text}, ...] }
 app.post("/api/summary", async (req, res) => {
   try {
     const { transcript } = req.body;
